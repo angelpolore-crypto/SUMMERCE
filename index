@@ -1,0 +1,304 @@
+/**
+ * BACKEND API REST - SUMERCE ALIMENTOS S.A.S. (DataPulse Suite Pro)
+ * CUC Posgrado - IA Aplicada a la Planeación Estratégica
+ */
+
+const SHEETS = {
+  USERS: 'Usuarios',
+  ORGANIZATION: 'Organizacion',
+  PRODUCTS: 'Productos',
+  SELLERS: 'Vendedores',
+  SALES: 'Ventas',
+  OKRS: 'OKRs',
+  CONFIG: 'Configuracion'
+};
+
+/**
+ * Punto de entrada POST para recibir peticiones AJAX desde DataPulse Suite Pro
+ */
+function doPost(e) {
+  try {
+    setupSheets(); // Verifica e inicializa las pestañas requeridas
+    
+    const requestData = JSON.parse(e.postData.contents);
+    const action = requestData.action;
+    const correo = requestData.correo || 'anonimo@sumerce.com';
+    const idUsuario = requestData.idUsuario || 'Usuario';
+
+    let response = { success: true, data: {} };
+
+    switch (action) {
+      
+      case 'login':
+        response.data = handleLogin(correo, idUsuario);
+        break;
+
+      case 'obtenerDatosDashboard':
+        response.data = getDashboardData();
+        break;
+
+      case 'guardarOrganizacion':
+        response.data = saveOrganizationData(requestData.orgData);
+        break;
+
+      case 'crearProducto':
+        saveDataRow(SHEETS.PRODUCTS, [
+          'PROD_' + Date.now(), 
+          requestData.producto.nombre, 
+          requestData.producto.stockInicial, 
+          requestData.producto.precio
+        ]);
+        break;
+
+      case 'crearVendedor':
+        saveDataRow(SHEETS.SELLERS, [
+          'VEND_' + Date.now(), 
+          requestData.vendedor.nombre, 
+          requestData.vendedor.zona
+        ]);
+        break;
+
+      case 'registrarVenta':
+        saveDataRow(SHEETS.SALES, [
+          'VNT_' + Date.now(),
+          requestData.venta.fecha,
+          requestData.venta.producto,
+          requestData.venta.cantidad,
+          requestData.venta.monto,
+          requestData.venta.vendedor,
+          requestData.venta.ubicacion
+        ]);
+        break;
+
+      case 'guardarObjetivo':
+        saveDataRow(SHEETS.OKRS, [
+          'OKR_' + Date.now(),
+          requestData.objetivo.objetivo,
+          requestData.objetivo.descripcion,
+          requestData.objetivo.meta,
+          requestData.objetivo.actual || 0
+        ]);
+        break;
+
+      case 'actualizarAvanceOKR':
+        updateOKRProgress(requestData.idObjetivo, requestData.nuevoActual);
+        break;
+
+      case 'guardarConfig':
+        saveConfig('MISTRAL_KEY', requestData.mistralKey);
+        break;
+
+      default:
+        response = { success: false, error: 'Acción no reconocida: ' + action };
+        break;
+    }
+
+    return createJsonResponse(response);
+
+  } catch (err) {
+    return createJsonResponse({ success: false, error: err.toString() });
+  }
+}
+
+/**
+ * Permite probar la URL desde el navegador
+ */
+function doGet(e) {
+  return createJsonResponse({ success: true, message: 'API REST de Sumerce Alimentos activa.' });
+}
+
+/* ==========================================================================
+   LÓGICA Y MANEJO DE HOJAS DE CÁLCULO
+   ========================================================================== */
+
+function setupSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const initialHeaders = {
+    [SHEETS.USERS]: ['Fecha', 'Correo', 'ID_Usuario'],
+    [SHEETS.ORGANIZATION]: ['Clave', 'ValorJSON'],
+    [SHEETS.PRODUCTS]: ['ID', 'Nombre', 'StockInicial', 'Precio'],
+    [SHEETS.SELLERS]: ['ID', 'Nombre', 'Zona'],
+    [SHEETS.SALES]: ['ID', 'Fecha', 'Producto', 'Cantidad', 'Monto', 'Vendedor', 'Ubicacion'],
+    [SHEETS.OKRS]: ['ID', 'Objetivo', 'Descripcion', 'Meta', 'Actual'],
+    [SHEETS.CONFIG]: ['Clave', 'Valor']
+  };
+
+  Object.keys(initialHeaders).forEach(sheetName => {
+    let sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      sheet = ss.insertSheet(sheetName);
+      sheet.appendRow(initialHeaders[sheetName]);
+    }
+  });
+}
+
+function handleLogin(correo, idUsuario) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetUsers = ss.getSheetByName(SHEETS.USERS);
+  const users = sheetUsers.getDataRange().getValues();
+  
+  let exists = false;
+  for (let i = 1; i < users.length; i++) {
+    if (users[i][1] === correo) {
+      exists = true;
+      break;
+    }
+  }
+
+  if (!exists) {
+    sheetUsers.appendRow([new Date(), correo, idUsuario]);
+  }
+
+  const org = getOrganizationData();
+
+  return {
+    idUsuario: idUsuario,
+    correo: correo,
+    esNuevo: !exists && (!org.nombreEmpresa),
+    organizacion: org
+  };
+}
+
+function getDashboardData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. Obtener Ventas
+  const salesSheet = ss.getSheetByName(SHEETS.SALES);
+  const salesRows = salesSheet ? salesSheet.getDataRange().getValues().slice(1) : [];
+  const ventas = salesRows.map(r => ({
+    id: r[0],
+    fecha: r[1],
+    producto: r[2],
+    cantidad: Number(r[3]),
+    monto: Number(r[4]),
+    vendedor: r[5],
+    ubicacion: r[6]
+  }));
+
+  // 2. Obtener Productos y calcular unidades vendidas
+  const prodSheet = ss.getSheetByName(SHEETS.PRODUCTS);
+  const prodRows = prodSheet ? prodSheet.getDataRange().getValues().slice(1) : [];
+  const productos = prodRows.map(r => {
+    const nombreProd = r[1];
+    const vendidos = ventas.filter(v => v.producto === nombreProd).reduce((acc, v) => acc + (v.cantidad || 1), 0);
+    return {
+      id: r[0],
+      nombre: nombreProd,
+      stockInicial: Number(r[2]),
+      precio: Number(r[3]),
+      vendidos: vendidos
+    };
+  });
+
+  // 3. Obtener Vendedores
+  const sellSheet = ss.getSheetByName(SHEETS.SELLERS);
+  const sellRows = sellSheet ? sellSheet.getDataRange().getValues().slice(1) : [];
+  const vendedores = sellRows.map(r => ({
+    id: r[0],
+    nombre: r[1],
+    zona: r[2]
+  }));
+
+  // 4. Obtener OKRs
+  const okrSheet = ss.getSheetByName(SHEETS.OKRS);
+  const okrRows = okrSheet ? okrSheet.getDataRange().getValues().slice(1) : [];
+  const objetivos = okrRows.map(r => ({
+    id: r[0],
+    objetivo: r[1],
+    descripcion: r[2],
+    meta: Number(r[3]),
+    actual: Number(r[4])
+  }));
+
+  // 5. Configuración e Identidad
+  const organizacion = getOrganizationData();
+  const mistralKey = getConfig('MISTRAL_KEY');
+
+  return {
+    ventas: ventas,
+    productos: productos,
+    vendedores: vendedores,
+    objetivos: objetivos,
+    organizacion: organizacion,
+    mistralKey: mistralKey
+  };
+}
+
+function saveOrganizationData(orgData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.ORGANIZATION);
+  sheet.clearContents();
+  sheet.appendRow(['Clave', 'ValorJSON']);
+  sheet.appendRow(['PERFIL_CORP', JSON.stringify(orgData)]);
+  return { nombreEmpresa: orgData.nombreEmpresa };
+}
+
+function getOrganizationData() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.ORGANIZATION);
+  if (!sheet) return {};
+  const rows = sheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === 'PERFIL_CORP') {
+      try {
+        return JSON.parse(rows[i][1]);
+      } catch (e) {
+        return {};
+      }
+    }
+  }
+  return {};
+}
+
+function updateOKRProgress(idObjetivo, nuevoActual) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.OKRS);
+  if (!sheet) return;
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === idObjetivo) {
+      sheet.getRange(i + 1, 5).setValue(nuevoActual);
+      break;
+    }
+  }
+}
+
+function saveConfig(clave, valor) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.CONFIG);
+  const rows = sheet.getDataRange().getValues();
+  let found = false;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === clave) {
+      sheet.getRange(i + 1, 2).setValue(valor);
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    sheet.appendRow([clave, valor]);
+  }
+}
+
+function getConfig(clave) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEETS.CONFIG);
+  if (!sheet) return '';
+  const rows = sheet.getDataRange().getValues();
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === clave) return rows[i][1];
+  }
+  return '';
+}
+
+function saveDataRow(sheetName, rowData) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+  sheet.appendRow(rowData);
+}
+
+function createJsonResponse(data) {
+  return ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+}
